@@ -1,5 +1,7 @@
 # Require the dependencies file to load the vendor libraries
 require File.expand_path(File.join(File.dirname(__FILE__), 'dependencies'))
+# Require the Office 365 Authentication file
+require File.expand_path(File.join(File.dirname(__FILE__), 'o365_authentication'))
 
 class MsprojectProjectCheckoutV1
   def initialize(input)
@@ -21,13 +23,8 @@ class MsprojectProjectCheckoutV1
   end
 
   def execute()
-    resources_path = File.join(File.expand_path(File.dirname(__FILE__)), 'resources')
-
-    # Create the command string that will be used to retrieve the cookies
-    cmd_string = "O365Auth.Console.exe #{@info_values['ms_project_location']} #{@info_values['username']} #{@info_values['password']} #{@info_values['integrated_authentication']}"
-
     # Retrieve the cookies
-    cookies = `cd "#{resources_path}" & #{cmd_string}`
+    cookies = get_office365_cookies(@info_values['ms_project_location'],@info_values['username'],@info_values['password'])
 
     proj_resource = RestClient::Resource.new(@info_values['ms_project_location'].chomp("/"),
       :headers => {:content_type => "application/json",:accept => "application/json", :cookie => cookies})
@@ -37,7 +34,7 @@ class MsprojectProjectCheckoutV1
     begin
       results = context_endpoint.post ""
     rescue RestClient::Exception => error
-      raise StandardError, error.inspect
+      raise StandardError, handle_error(error)[:message]
     end
 
     json = JSON.parse(results)
@@ -47,34 +44,75 @@ class MsprojectProjectCheckoutV1
 
     checkout_endpoint = proj_resource["/_api/ProjectServer/Projects('#{@parameters['project_id']}')/checkOut()/IncludeCustomFields"]
 
-    retry_num = 0
-    need_retry = true
-    error_copy = nil
-    while need_retry == true && retry_num < 12
+    times_to_try = 12
+    error_details = {:retry => true, :message => nil}
+    while error_details[:retry]
       begin
         puts "Checking out project '#{@parameters['project_id']}'" if @enable_debug_logging
         checkout_endpoint.post ""
-        need_retry = false
+        puts "Successfully checked out project '#{@parameters['project_id']}'"
+        break
       rescue RestClient::Exception => error
-        if error.http_code == 403
-          puts "Server returned a non fatal 403 forbidden. Attempting again #{11-retry_num} more time(s)" if @enable_debug_logging
-          retry_num += 1
-          error_copy = error
+        error_details = handle_error(error)
+        if error_details[:retry]
+          puts times_to_try
+          times_to_try -= 1
+          if times_to_try > 0
+            puts "Server returned a non fatal 403 forbidden. Attempting again #{times_to_try} more time(s). #{error_details[:message]}" if @enable_debug_logging
+          else
+            raise StandardError, error_details[:message]
+          end
           sleep(10)
-        else
-          raise StandardError, error.inspect
         end
       end
-    end
-
-    if need_retry == true
-      raise StandardError, error_copy.inspect
     end
 
     # Return the results
     <<-RESULTS
     <results/>
     RESULTS
+  end
+
+  def handle_error(error)
+    error_message = error.inspect
+    code = nil
+    value = nil
+    needs_retry = false
+    begin
+      json = JSON.parse(error.response.to_s)
+      if !json["odata.error"].nil?
+        if !json["odata.error"]["message"].nil? && !json["odata.error"]["message"]["value"].nil?
+          error_message = json["odata.error"]["message"]["value"].to_s
+          value = json["odata.error"]["message"]["value"]
+        end
+
+        # If a project is equal to the following codes, it the retry variable 
+        # will be set to true because they are non-fatal 403's
+        if json["odata.error"]["code"] == "1030, Microsoft.ProjectServer.PJClientCallableException" || # ProjectWriteLock
+          json["odata.error"]["code"] == "10103, Microsoft.ProjectServer.PJClientCallableException" # Checked out in other session
+          needs_retry = true
+        end
+
+        if !json["odata.error"]["code"].nil?
+          if json["odata.error"]["code"].split(",").length > 1
+            if json["odata.error"]["code"].split(",")[1].strip == "Microsoft.SharePoint.Client.ResourceNotFoundException"
+              error_message = "Invalid Project: Can't find a project with an id of '#{@parameters['project_id']}'"
+            else
+              code = json["odata.error"]["code"].split(",")[0].strip
+            end
+          end
+        end
+      end
+    rescue Exception
+      # If the Response data can't be parsed, throw a standard error
+      raise StandardError, error.inspect
+    end
+
+    if code != nil && value != nil
+      error_message = "Error Name: #{value}, Code: #{code}. Too see more details about this error, see Project Server 2013 error codes (https://msdn.microsoft.com/en-us/library/office/ms508961.aspx)."
+    end
+
+    {:retry => needs_retry, :message => error_message}
   end
 
   # This is a template method that is used to escape results values (returned in

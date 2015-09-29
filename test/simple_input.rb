@@ -2,7 +2,6 @@
   'info' => {
     'username' => '',
     'password' => '',
-    'integrated_authentication' => '',
     'ms_project_location' => '',
     'enable_debug_logging' => 'Yes'
   },
